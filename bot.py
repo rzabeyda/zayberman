@@ -37,6 +37,8 @@ MONTHS = ["", "Январь", "Февраль", "Март", "Апрель", "М�
 ACTIVE = ("hold", "review", "paid")
 STATUS = {"hold": "⏳ ждёт оплаты", "review": "🔎 оплата на проверке", "paid": "✅ оплачено"}
 
+PAY_METHODS = {"pp": "PayPal", "da": "DonationAlerts", "tr": "Tribute", "rv": "Revolut / банк", "cr": "USDT / GRAM"}
+
 BTN_BOOK, BTN_MY, BTN_CONTACT, BTN_ADMIN = "📝 Запись", "📋 Брони", "💬 Связаться", "⚙️ Админка"
 
 router = Router()
@@ -283,8 +285,8 @@ async def pay_text(b):
         f"• Revolut / банк: {REVOLUT_NAME}\n  IBAN <code>{REVOLUT_IBAN}</code>\n"
         f"• USDT или GRAM (сеть GRAM/TON):\n  <code>{TON_ADDR}</code>\n"
         f"  ⚠️ В комментарии укажите код <code>{b['code']}</code> — оплата подтвердится автоматически.\n\n"
-        f"В остальных случаях укажите код <code>{b['code']}</code> в комментарии, если можно, "
-        f"затем нажмите «📸 Я оплатил» и пришлите скриншот.\n\n"
+        f"Другие способы: по возможности укажите код <code>{b['code']}</code> в комментарии "
+        f"и после оплаты нажмите «✅ Я оплатил».\n\n"
         f"⏳ Бронь держится ещё ~{hold_left // 60} ч {hold_left % 60} мин, затем время освободится."
     )
 
@@ -301,7 +303,7 @@ async def pay_kb(b):
         rows.append([ib("💎 GRAM через Tonkeeper",
                         url=f"https://app.tonkeeper.com/transfer/{TON_ADDR}?amount={nano}&text={b['code']}")])
     rows += [
-        [ib("📸 Я оплатил — отправить скрин", f"shot:{b['id']}")],
+        [ib("✅ Я оплатил", f"paid:{b['id']}")],
         [ib("❌ Отменить бронь", f"mbx:{b['id']}")],
     ]
     return kb(rows)
@@ -404,7 +406,7 @@ async def handle_shot(m: Message, bid):
             await m.bot.send_document(ADMIN_ID, m.document.file_id, caption=cap, reply_markup=mk)
     except Exception:
         log.exception("shot to admin")
-    await m.answer("👍 Скрин получен! Проверю оплату и подтвержу бронь — вам придёт сообщение.",
+    await m.answer("👍 Скрин получен, спасибо! Подтвержу бронь после проверки.",
                    reply_markup=main_kb(m.from_user.id))
 
 
@@ -420,7 +422,8 @@ async def shot_wrong(m: Message, state: FSMContext):
     if m.text in (BTN_BOOK, BTN_MY, BTN_CONTACT, BTN_ADMIN):
         await state.clear()
         return await route_text(m, state)
-    await m.answer("Пришлите, пожалуйста, скриншот оплаты картинкой или файлом.")
+    await state.clear()
+    await fallback(m, state)
 
 
 async def route_text(m, state):
@@ -442,7 +445,7 @@ async def photo_any(m: Message):
     if not bs:
         await m.answer("У вас нет броней, ожидающих оплаты.")
     else:
-        await m.answer("Откройте «📋 Брони», выберите бронь и нажмите «📸 Я оплатил».")
+        await m.answer("Откройте «📋 Брони», выберите бронь и нажмите «✅ Я оплатил».")
 
 
 # ───────────────────────── admin views ─────────────────────────
@@ -662,7 +665,7 @@ async def cb(cq: CallbackQuery, state: FSMContext):
         t, k = my_view(uid)
         return await edit(cq, t, k)
 
-    if cmd in ("mb", "mbr", "mbx", "mbxy", "pay", "shot"):
+    if cmd in ("mb", "mbr", "mbx", "mbxy", "pay", "shot", "paid", "pm"):
         b = get_b(int(args[0]))
         if not b or b["user_id"] != uid or b["status"] not in ACTIVE:
             await cq.answer("Бронь неактивна", show_alert=True)
@@ -696,6 +699,27 @@ async def cb(cq: CallbackQuery, state: FSMContext):
             await edit(cq, f"❌ Бронь на {fmt_client(b['start_utc'])} отменена.")
             return await to_admin(bot, f"❌ {who(b)} отменил бронь на {fmt_admin(b['start_utc'])}\n"
                                        f"Была: {STATUS[b['status']]}")
+        if cmd == "paid":
+            await cq.answer()
+            return await cq.message.answer(
+                "Чем вы оплатили?",
+                reply_markup=kb([[ib(v, f"pm:{bid}:{k}")] for k, v in PAY_METHODS.items()]))
+        if cmd == "pm":
+            method = PAY_METHODS.get(args[1], args[1])
+            if b["status"] not in ("hold", "review"):
+                return await cq.answer("Бронь уже оплачена", show_alert=True)
+            ex("UPDATE bookings SET status='review', pay_note=COALESCE(pay_note,'')||? WHERE id=?",
+               (f" клиент: {method}", bid))
+            await cq.answer()
+            await edit(cq, f"👍 Спасибо! Оплата ({method}) отмечена — проверю поступление и подтвержу бронь, "
+                           f"вам придёт сообщение.\n\nЕсли есть скрин — можете прислать его сюда (необязательно).")
+            await state.set_state(Shot.wait)
+            await state.update_data(bid=bid)
+            return await to_admin(bot, f"💳 {who(b)} отметил оплату: <b>{method}</b>\n"
+                                       f"Бронь {b['code']}: {fmt_admin(b['start_utc'])}\n"
+                                       f"Сумма: {b['price_rub']} ₽ / {b['price_usd']} $ / {b['price_eur']} €\n"
+                                       f"Проверь поступление 👇",
+                                  kb([[ib("✅ Подтвердить", f"aok:{bid}"), ib("❌ Отклонить", f"ano:{bid}")]]))
         if cmd == "shot":
             await cq.answer()
             await state.set_state(Shot.wait)
