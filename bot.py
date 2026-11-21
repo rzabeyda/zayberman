@@ -48,6 +48,11 @@ class Shot(StatesGroup):
     wait = State()
 
 
+class AdminSt(StatesGroup):
+    bcast = State()
+    ban = State()
+
+
 # ───────────────────────── DB ─────────────────────────
 def db():
     c = sqlite3.connect(DB_PATH)
@@ -70,6 +75,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, first_ts INTEGER);
         CREATE TABLE IF NOT EXISTS chain_seen(h TEXT PRIMARY KEY);
         """)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
+        if "banned" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0")
 
 
 def q(sql, args=(), one=False):
@@ -405,6 +413,48 @@ async def handle_shot(m: Message, bid):
                    reply_markup=main_kb(m.from_user.id))
 
 
+@router.message(AdminSt.bcast)
+async def admin_bcast_in(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    if m.text in (BTN_BOOK, BTN_MY, BTN_CONTACT, BTN_ADMIN):
+        await state.clear()
+        return await route_text(m, state)
+    await state.clear()
+    n = q("SELECT COUNT(*) n FROM users WHERE COALESCE(banned,0)=0 AND user_id!=?", (ADMIN_ID,), one=True)["n"]
+    await m.answer("👆 Так увидят сообщение пользователи. Отправить?")
+    await m.bot.copy_message(m.chat.id, m.chat.id, m.message_id)
+    await m.answer(f"Получателей: <b>{n}</b>",
+                   reply_markup=kb([[ib(f"✅ Отправить всем ({n})", f"abcgo:{m.chat.id}:{m.message_id}")],
+                                    [ib("❌ Отмена", "a")]]))
+
+
+@router.message(AdminSt.ban)
+async def admin_ban_in(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    if m.text in (BTN_BOOK, BTN_MY, BTN_CONTACT, BTN_ADMIN):
+        await state.clear()
+        return await route_text(m, state)
+    await state.clear()
+    t = (m.text or "").strip().lstrip("@")
+    u = None
+    if t.isdigit():
+        u = q("SELECT * FROM users WHERE user_id=?", (int(t),), one=True)
+        if not u:
+            ex("INSERT OR IGNORE INTO users(user_id, username, full_name, first_ts) VALUES(?,?,?,?)",
+               (int(t), None, None, int(_time.time())))
+            u = q("SELECT * FROM users WHERE user_id=?", (int(t),), one=True)
+    elif t:
+        u = q("SELECT * FROM users WHERE lower(username)=lower(?)", (t,), one=True)
+    if not u:
+        return await m.answer("Пользователь не найден (он должен хоть раз запустить бота). Пришлите @username или ID.",
+                              reply_markup=kb([[ib("⬅️ Баны", "abl")]]))
+    set_ban(u["user_id"], True)
+    tx, k = user_card(u["user_id"])
+    await m.answer("🚫 Забанен.\n\n" + tx, reply_markup=k)
+
+
 @router.message(Shot.wait, F.photo | F.document)
 async def shot_in_state(m: Message, state: FSMContext):
     data = await state.get_data()
@@ -451,10 +501,123 @@ def is_admin(uid):
 def admin_menu():
     n = q("SELECT COUNT(*) n FROM bookings WHERE status='review'", one=True)["n"]
     return kb([
-        [ib("📅 Расписание (закрыть часы/дни/месяцы)", "ac:now")],
-        [ib("📋 Ближайшие брони", "al")],
+        [ib("📅 Расписание", "ac:now")],
+        [ib("🗓 Брони на сегодня", "at"), ib("📋 Все брони", "al")],
         [ib(f"🔎 Оплаты на проверке ({n})", "ar")],
+        [ib("👥 Пользователи", "au:0"), ib("📊 Статистика", "ast")],
+        [ib("📢 Рассылка", "abc"), ib("🚫 Баны", "abl")],
     ])
+
+
+def is_banned(uid):
+    r = q("SELECT banned FROM users WHERE user_id=?", (uid,), one=True)
+    return bool(r and r["banned"])
+
+
+def set_ban(uid, val):
+    ex("UPDATE users SET banned=? WHERE user_id=?", (1 if val else 0, uid))
+    if val:
+        ex("UPDATE bookings SET status='cancelled' WHERE user_id=? AND status IN ('hold','review')", (uid,))
+
+
+def uname(u):
+    return f"@{u['username']}" if u["username"] else (u["full_name"] or str(u["user_id"]))
+
+
+def admin_today():
+    t = today_admin()
+    bs = active_between(local_to_utc(t, 0), local_to_utc(t, 24 * 60))
+    title = f"🗓 <b>Брони на сегодня</b> ({t:%d.%m}, {TZ_ADMIN_LABEL})"
+    rows = [[ib(f"{u2(b['start_utc']).astimezone(ATZ):%H:%M} {b['username'] or b['full_name']} · {STATUS[b['status']]}",
+                f"ab:{b['id']}")] for b in bs]
+    rows.append([ib("⬅️ Меню", "a")])
+    return title + ("" if bs else "\n\nНа сегодня броней нет."), kb(rows)
+
+
+PAGE = 10
+
+
+def users_page(page):
+    total = q("SELECT COUNT(*) n FROM users", one=True)["n"]
+    us = q("""SELECT u.*, (SELECT COUNT(*) FROM bookings b WHERE b.user_id=u.user_id) nb,
+              (SELECT COUNT(*) FROM bookings b WHERE b.user_id=u.user_id AND b.status='paid') np
+              FROM users u ORDER BY u.first_ts DESC LIMIT ? OFFSET ?""", (PAGE, page * PAGE))
+    rows = []
+    for u in us:
+        mark = "🚫 " if u["banned"] else ""
+        info = f"{u['nb']} брон." + (f", {u['np']} оплач." if u["np"] else "") if u["nb"] else "без броней"
+        rows.append([ib(f"{mark}{uname(u)} · {info}", f"auu:{u['user_id']}")])
+    nav = []
+    if page > 0:
+        nav.append(ib("◀️", f"au:{page - 1}"))
+    if (page + 1) * PAGE < total:
+        nav.append(ib("▶️", f"au:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([ib("⬅️ Меню", "a")])
+    pages = max(1, math.ceil(total / PAGE))
+    return f"👥 <b>Пользователи</b>: {total} (стр. {page + 1}/{pages})\nНовые сверху.", kb(rows)
+
+
+def user_card(uid):
+    u = q("SELECT * FROM users WHERE user_id=?", (uid,), one=True)
+    if not u:
+        return "Пользователь не найден.", kb([[ib("⬅️ Пользователи", "au:0")]])
+    bs = q("SELECT * FROM bookings WHERE user_id=? ORDER BY start_utc DESC LIMIT 15", (uid,))
+    cnt = {}
+    for b in q("SELECT status, COUNT(*) n FROM bookings WHERE user_id=? GROUP BY status", (uid,)):
+        cnt[b["status"]] = b["n"]
+    first = datetime.fromtimestamp(u["first_ts"] or 0, ATZ)
+    lines = [f"👤 <b>{esc(uname(u))}</b> {('🚫 ЗАБАНЕН' if u['banned'] else '')}",
+             f"Имя: {esc(u['full_name'])}", f"ID: <code>{uid}</code>", f"В боте с {first:%d.%m.%Y}",
+             f"\nБроней всего: <b>{sum(cnt.values())}</b> · оплачено {cnt.get('paid', 0)} · "
+             f"отменено {cnt.get('cancelled', 0)} · не оплачено {cnt.get('expired', 0) + cnt.get('rejected', 0)}"]
+    names = {"cancelled": "❌ отменена", "expired": "⌛ не оплачена", "rejected": "❌ отклонена"}
+    if bs:
+        lines.append("\n<b>История:</b>")
+        for b in bs:
+            lines.append(f"• {fmt_admin(b['start_utc'])} — {STATUS.get(b['status']) or names.get(b['status'], b['status'])}")
+    rows = [[ib("✅ Разбанить" if u["banned"] else "🚫 Забанить", f"{'aunban' if u['banned'] else 'aban'}:{uid}")]]
+    if u["username"]:
+        rows.append([ib("✉️ Написать", url=f"https://t.me/{u['username']}")])
+    rows.append([ib("⬅️ Пользователи", "au:0")])
+    return "\n".join(lines), kb(rows)
+
+
+def bans_view():
+    us = q("SELECT * FROM users WHERE banned=1 ORDER BY first_ts DESC")
+    rows = [[ib(f"✅ Разбанить {uname(u)}", f"aunban:{u['user_id']}")] for u in us]
+    rows.append([ib("➕ Забанить по @username / ID", "abadd")])
+    rows.append([ib("⬅️ Меню", "a")])
+    return f"🚫 <b>Баны</b>: {len(us)}" + ("" if us else "\n\nНикто не забанен."), kb(rows)
+
+
+def stats_text():
+    now = int(_time.time())
+    t0 = int(datetime.combine(today_admin(), dtime(0), tzinfo=ATZ).timestamp())
+    u_all = q("SELECT COUNT(*) n FROM users", one=True)["n"]
+    u_today = q("SELECT COUNT(*) n FROM users WHERE first_ts>=?", (t0,), one=True)["n"]
+    u_7 = q("SELECT COUNT(*) n FROM users WHERE first_ts>=?", (now - 7 * 86400,), one=True)["n"]
+    u_ban = q("SELECT COUNT(*) n FROM users WHERE banned=1", one=True)["n"]
+    u_book = q("SELECT COUNT(DISTINCT user_id) n FROM bookings", one=True)["n"]
+    st = {r["status"]: r["n"] for r in q("SELECT status, COUNT(*) n FROM bookings GROUP BY status")}
+    nowf = now_utc().strftime(FMT)
+    done = q("SELECT COUNT(*) n FROM bookings WHERE status='paid' AND start_utc<?", (nowf,), one=True)["n"]
+    ahead = q("SELECT COUNT(*) n FROM bookings WHERE status='paid' AND start_utc>=?", (nowf,), one=True)["n"]
+    rev = q("SELECT COALESCE(SUM(price_rub),0) s FROM bookings WHERE status='paid'", one=True)["s"]
+    m0 = today_admin().replace(day=1)
+    rev_m = q("SELECT COALESCE(SUM(price_rub),0) s FROM bookings WHERE status='paid' AND start_utc>=?",
+              (local_to_utc(m0, 0).strftime(FMT),), one=True)["s"]
+    conv = f"{u_book / u_all * 100:.0f}%" if u_all else "—"
+    return (f"📊 <b>Статистика</b>\n\n"
+            f"👥 Пользователей: <b>{u_all}</b> (сегодня +{u_today}, за 7 дн. +{u_7})\n"
+            f"🚫 Забанено: {u_ban}\n"
+            f"📝 Хоть раз бронировали: {u_book} ({conv})\n\n"
+            f"✅ Оплачено консультаций: <b>{st.get('paid', 0)}</b> (проведено {done}, впереди {ahead})\n"
+            f"🔎 На проверке: {st.get('review', 0)} · ⏳ ждут оплаты: {st.get('hold', 0)}\n"
+            f"❌ Отменено: {st.get('cancelled', 0)} · ⌛ не оплачено: {st.get('expired', 0) + st.get('rejected', 0)}\n\n"
+            f"💰 Выручка всего: <b>{rev} ₽</b>\n"
+            f"💰 В этом месяце: <b>{rev_m} ₽</b>")
 
 
 def admin_cal(y, m):
@@ -519,7 +682,7 @@ def admin_list(review_only=False):
     else:
         lo = (now_utc() - timedelta(minutes=DURATION)).strftime(FMT)
         bs = q(f"SELECT * FROM bookings WHERE status IN {ACTIVE} AND start_utc>=? ORDER BY start_utc LIMIT 40", (lo,))
-        title = "📋 <b>Ближайшие брони</b>"
+        title = "📋 <b>Все брони</b> (предстоящие)"
     if not bs:
         return title + "\n\nПусто.", kb([[ib("⬅️ Меню", "a")]])
     rows = [[ib(f"{u2(b['start_utc']).astimezone(ATZ):%d.%m %H:%M} {b['username'] or b['full_name']} · "
@@ -541,6 +704,7 @@ def admin_booking(b):
         rows.append([ib("❌ Отменить бронь", f"ax:{b['id']}")])
     if b["username"]:
         rows.append([ib("✉️ Написать клиенту", url=f"https://t.me/{b['username']}")])
+    rows.append([ib("👤 Профиль клиента", f"auu:{b['user_id']}")])
     rows.append([ib("⬅️ Список", "al")])
     return t, kb(rows)
 
@@ -566,7 +730,8 @@ async def edit(cq: CallbackQuery, text, markup=None):
             await cq.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
 
 
-ADMIN_CMDS = {"a", "ac", "ad", "ah", "adc", "amc", "al", "ar", "ab", "aok", "ano", "ax", "axy"}
+ADMIN_CMDS = {"a", "ac", "ad", "ah", "adc", "amc", "al", "ar", "ab", "aok", "ano", "ax", "axy",
+              "at", "au", "auu", "aban", "aunban", "abl", "abadd", "abc", "abcgo", "ast"}
 
 
 @router.callback_query()
@@ -724,6 +889,7 @@ async def cb(cq: CallbackQuery, state: FSMContext):
     # ── admin ──
     if cmd == "a":
         await cq.answer()
+        await state.clear()
         return await edit(cq, "🔒 <b>Админка</b>", admin_menu())
     if cmd == "ac":
         await cq.answer()
@@ -773,6 +939,48 @@ async def cb(cq: CallbackQuery, state: FSMContext):
         await cq.answer("Месяц закрыт" if close else "Месяц открыт")
         t, k = admin_cal(y, m)
         return await edit(cq, t, k)
+    if cmd == "at":
+        await cq.answer()
+        t, k = admin_today()
+        return await edit(cq, t, k)
+    if cmd == "au":
+        await cq.answer()
+        t, k = users_page(int(args[0]))
+        return await edit(cq, t, k)
+    if cmd == "auu":
+        await cq.answer()
+        t, k = user_card(int(args[0]))
+        return await edit(cq, t, k)
+    if cmd in ("aban", "aunban"):
+        tuid = int(args[0])
+        if tuid == ADMIN_ID:
+            return await cq.answer("Себя нельзя", show_alert=True)
+        set_ban(tuid, cmd == "aban")
+        await cq.answer("Забанен 🚫" if cmd == "aban" else "Разбанен ✅")
+        t, k = user_card(tuid)
+        return await edit(cq, t, k)
+    if cmd == "abl":
+        await cq.answer()
+        await state.clear()
+        t, k = bans_view()
+        return await edit(cq, t, k)
+    if cmd == "abadd":
+        await cq.answer()
+        await state.set_state(AdminSt.ban)
+        return await edit(cq, "Пришлите @username или ID пользователя для бана:", kb([[ib("❌ Отмена", "abl")]]))
+    if cmd == "ast":
+        await cq.answer()
+        return await edit(cq, stats_text(), kb([[ib("🔄 Обновить", "ast")], [ib("⬅️ Меню", "a")]]))
+    if cmd == "abc":
+        await cq.answer()
+        await state.set_state(AdminSt.bcast)
+        return await edit(cq, "📢 Пришлите сообщение для рассылки (текст, фото, видео — что угодно).",
+                          kb([[ib("❌ Отмена", "a")]]))
+    if cmd == "abcgo":
+        await cq.answer("Рассылка запущена")
+        await edit(cq, "📢 Рассылка запущена, по окончании пришлю отчёт.")
+        asyncio.create_task(broadcast(bot, int(args[0]), int(args[1])))
+        return
     if cmd in ("al", "ar"):
         await cq.answer()
         t, k = admin_list(cmd == "ar")
@@ -945,10 +1153,33 @@ async def worker(bot):
         await asyncio.sleep(30)
 
 
+async def broadcast(bot, chat_id, msg_id):
+    ok = fail = 0
+    for u in q("SELECT user_id FROM users WHERE COALESCE(banned,0)=0 AND user_id!=?", (ADMIN_ID,)):
+        try:
+            await bot.copy_message(u["user_id"], chat_id, msg_id)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await to_admin(bot, f"📢 Рассылка завершена: доставлено <b>{ok}</b>, не доставлено {fail} (заблокировали бота).")
+
+
+async def ban_mw(handler, event, data):
+    u = getattr(event, "from_user", None)
+    if u and u.id != ADMIN_ID and is_banned(u.id):
+        if isinstance(event, CallbackQuery):
+            await event.answer("Доступ ограничен", show_alert=True)
+        return
+    return await handler(event, data)
+
+
 async def main():
     init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
+    dp.message.outer_middleware(ban_mw)
+    dp.callback_query.outer_middleware(ban_mw)
     dp.include_router(router)
     asyncio.create_task(worker(bot))
     await bot.delete_webhook(drop_pending_updates=True)
