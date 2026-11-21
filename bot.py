@@ -501,9 +501,8 @@ def is_admin(uid):
 def admin_menu():
     n = q("SELECT COUNT(*) n FROM bookings WHERE status='review'", one=True)["n"]
     return kb([
-        [ib("📅 Расписание", "ac:now")],
+        [ib("📅 Расписание", "ac:now"), ib(f"🔎 Оплаты ({n})", "ar")],
         [ib("🗓 Брони на сегодня", "at"), ib("📋 Все брони", "al")],
-        [ib(f"🔎 Оплаты ({n})", "ar")],
         [ib("👥 Пользователи", "au:0"), ib("📊 Статистика", "ast")],
         [ib("📢 Рассылка", "abc"), ib("🚫 Баны", "abl")],
     ])
