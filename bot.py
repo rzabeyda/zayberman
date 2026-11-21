@@ -503,7 +503,7 @@ def admin_menu():
     return kb([
         [ib("📅 Расписание", "ac:now")],
         [ib("🗓 Брони на сегодня", "at"), ib("📋 Все брони", "al")],
-        [ib(f"🔎 Оплаты на проверке ({n})", "ar")],
+        [ib(f"🔎 Оплаты ({n})", "ar")],
         [ib("👥 Пользователи", "au:0"), ib("📊 Статистика", "ast")],
         [ib("📢 Рассылка", "abc"), ib("🚫 Баны", "abl")],
     ])
@@ -678,7 +678,7 @@ def admin_day(ds):
 def admin_list(review_only=False):
     if review_only:
         bs = q("SELECT * FROM bookings WHERE status='review' ORDER BY start_utc")
-        title = "🔎 <b>Оплаты на проверке</b>"
+        title = "🔎 <b>Оплаты</b> (ждут подтверждения)"
     else:
         lo = (now_utc() - timedelta(minutes=DURATION)).strftime(FMT)
         bs = q(f"SELECT * FROM bookings WHERE status IN {ACTIVE} AND start_utc>=? ORDER BY start_utc LIMIT 40", (lo,))
