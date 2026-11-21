@@ -39,7 +39,7 @@ STATUS = {"hold": "⏳ ждёт оплаты", "review": "🔎 оплата на
 
 PAY_METHODS = {"pp": "PayPal", "da": "DonationAlerts", "tr": "Tribute", "rv": "Revolut / банк", "cr": "USDT / GRAM"}
 
-BTN_BOOK, BTN_MY, BTN_CONTACT, BTN_ADMIN = "📝 Запись", "📋 Брони", "💬 Связаться", "⚙️ Админка"
+BTN_BOOK, BTN_MY, BTN_CONTACT, BTN_ADMIN = "📝 Запись", "📋 Брони", "💬 Связаться", "🔒 Админка"
 
 router = Router()
 
@@ -551,7 +551,7 @@ async def admin_entry(m: Message, state: FSMContext):
     await state.clear()
     if not is_admin(m.from_user.id):
         return
-    await m.answer("⚙️ <b>Админка</b>", reply_markup=admin_menu())
+    await m.answer("🔒 <b>Админка</b>", reply_markup=admin_menu())
 
 
 # ───────────────────────── callbacks ─────────────────────────
@@ -724,7 +724,7 @@ async def cb(cq: CallbackQuery, state: FSMContext):
     # ── admin ──
     if cmd == "a":
         await cq.answer()
-        return await edit(cq, "⚙️ <b>Админка</b>", admin_menu())
+        return await edit(cq, "🔒 <b>Админка</b>", admin_menu())
     if cmd == "ac":
         await cq.answer()
         if args[0] == "now":
