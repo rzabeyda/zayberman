@@ -274,6 +274,8 @@ def parse_ym(s):
 # ───────────────────────── payment ─────────────────────────
 async def pay_text(b):
     hold_left = max(0, int((b["hold_until_ts"] - _time.time()) // 60))
+    tp = await ton_price()
+    gram_line = f" или <code>{math.ceil(b['price_usd'] / tp * 100) / 100:g}</code> GRAM" if tp else ""
     return (
         f"🧾 <b>Бронь {b['code']}</b>\n"
         f"📅 {fmt_client(b['start_utc'])}\n"
@@ -283,8 +285,12 @@ async def pay_text(b):
         f"• DonationAlerts: {DALINK}\n"
         f"• Tribute (оплата в Telegram): {TRIBUTE}\n"
         f"• Revolut / банк: {REVOLUT_NAME}\n  IBAN <code>{REVOLUT_IBAN}</code>\n"
-        f"• USDT или GRAM (сеть GRAM/TON):\n  <code>{TON_ADDR}</code>\n"
-        f"  ⚠️ В комментарии укажите код <code>{b['code']}</code> — оплата подтвердится автоматически.\n\n"
+        f"• <b>USDT или GRAM</b> (сеть TON) — из любого кошелька: Gram Wallet в Telegram, Tonkeeper, Walt и др.\n"
+        f"  Сумма: <code>{b['price_usd']}</code> USDT{gram_line}\n"
+        f"  Адрес: <code>{TON_ADDR}</code>\n"
+        f"  Комментарий: <code>{b['code']}</code>\n"
+        f"  ⚠️ С этим комментарием оплата подтвердится автоматически.\n"
+        f"  (нажмите на сумму, адрес или код, чтобы скопировать)\n\n"
         f"Другие способы: по возможности укажите код <code>{b['code']}</code> в комментарии "
         f"и после оплаты нажмите «✅ Я оплатил».\n\n"
         f"⏳ Бронь держится ещё ~{hold_left // 60} ч {hold_left % 60} мин, затем время освободится."
@@ -292,21 +298,10 @@ async def pay_text(b):
 
 
 async def pay_kb(b):
-    usdt_amt = int(b["price_usd"] * 1_000_000)
-    rows = [
-        [ib("💎 USDT через Tonkeeper",
-            url=f"https://app.tonkeeper.com/transfer/{TON_ADDR}?jetton={USDT_MASTER}&amount={usdt_amt}&text={b['code']}")],
-    ]
-    tp = await ton_price()
-    if tp:
-        nano = int(math.ceil(b["price_usd"] / tp * 100) / 100 * 1e9)
-        rows.append([ib("💎 GRAM через Tonkeeper",
-                        url=f"https://app.tonkeeper.com/transfer/{TON_ADDR}?amount={nano}&text={b['code']}")])
-    rows += [
+    return kb([
         [ib("✅ Я оплатил", f"paid:{b['id']}")],
         [ib("❌ Отменить бронь", f"mbx:{b['id']}")],
-    ]
-    return kb(rows)
+    ])
 
 
 # ───────────────────────── notify ─────────────────────────
